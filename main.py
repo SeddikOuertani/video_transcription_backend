@@ -51,11 +51,59 @@ async def transcribe_video(file: UploadFile = File(...)):
 
     return {"success": True, "message": "video transcribed successfully"}
 
+
+@app.post("/stream-transcribe/")
+async def stream_transcribe(file: UploadFile = File(...)):
+    async def event_stream():
+        try:
+            # Step 1: Save file to disk (streaming, not loading into memory)
+            video_path = os.path.join(UPLOAD_DIR, file.filename)
+            await save_file_as_chunks(file, video_path)
+
+            # Step 2: Extract audio
+            audio_path = os.path.join(AUDIO_DIR, f"{os.path.splitext(file.filename)[0]}.mp3")
+            yield "Extracting audio...\n"
+            await asyncio.to_thread(extract_audio, video_path, audio_path)
+            yield "Audio extracted.\n"
+
+            # Step 3: Upload to AssemblyAI
+            transcriber = aai.Transcriber(config=config)
+            transcript = transcriber.transcribe(audio_path, poll=False)  # async job
+            yield f"Started transcription job {transcript.id}\n"
+
+            # Step 4: Poll for progress
+            while True:
+                status = aai.Transcript.get_by_id(transcript.id)
+                if status.status == "completed":
+                    yield "Transcription complete!\n\n"
+                    yield status.text
+                    break
+                elif status.status == "error":
+                    yield f"Error: {status.error}\n"
+                    break
+                else:
+                    yield f"Progress: {status.status}\n"
+                    await asyncio.sleep(5)
+        except Exception as e:
+            yield f"Error: {str(e)}\n"
+
+    return StreamingResponse(event_stream(), media_type="text/plain")
+
 async def save_file(file: UploadFile, destination: str):
     """Save uploaded file asynchronously."""
     content = await file.read()  # <-- just read the file
     with open(destination, "wb") as out_file:
         out_file.write(content)
+
+async def save_file_as_chunks(file: UploadFile, destination: str):
+    """Save uploaded file asynchronously in chunks."""
+    with open(destination, "wb") as out_file:
+        while True:
+            chunk = await file.read(1024 * 1024)  # 1MB chunks
+            if not chunk:
+                break
+            out_file.write(chunk)
+    await file.close()  # Explicitly close the file after saving
 
 def extract_audio(video_path: str, audio_path: str):
     """Extract audio from video using ffmpeg."""
