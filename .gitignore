@@ -1,0 +1,5 @@
+.env
+audios/
+uploads/
+__pycache__/
+transcripts/
