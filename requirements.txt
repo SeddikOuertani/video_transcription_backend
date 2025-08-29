@@ -1,3 +1,4 @@
 dotenv
-fastapi
+fastapi[standard]
+uvicorn[standard]
 assemblyai
