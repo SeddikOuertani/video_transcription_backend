@@ -29,60 +29,70 @@ if not ASSEMBLYAI_API_KEY:
 aai.settings.api_key = ASSEMBLYAI_API_KEY
 config = aai.TranscriptionConfig(speech_model=aai.SpeechModel.best)
 
-@app.post("/transcribe-video/")
-async def transcribe_video(file: UploadFile = File(...)):
-    # Validate file type
-    if not file.content_type.startswith("video/"):
-        return JSONResponse(
-            content={"error": "Only video files are allowed"},
-            status_code=400
-        )
-
-    # Prepare file paths
-    video_path = os.path.join(UPLOAD_DIR, file.filename)
-    audio_path = os.path.join(AUDIO_DIR, f"{os.path.splitext(file.filename)[0]}.mp3")
-    transcript_path = os.path.join(TRANSCRIPT_DIR, f"{os.path.splitext(file.filename)[0]}.txt")
-
-    # Save uploaded video
-    await save_file(file, video_path)
-
-    # Extract audio (blocking operation offloaded to thread)
-    await asyncio.to_thread(extract_audio, video_path, audio_path)
-
-    # Transcribe audio (blocking operation offloaded to thread)
-    await asyncio.to_thread(transcribe_audio, audio_path, transcript_path)
-
-    return {"success": True, "message": "video transcribed successfully"}
+# In-memory job store (replace with DB/Redis in production)
+jobs: Dict[str, Dict] = {}
 
 
-@app.post("/transcribe-video-stream/")
-async def transcribe_video_stream(file: UploadFile = File(...)):
+@app.post("/jobs/")
+async def create_job(file: UploadFile = File(...)):
     if not file.content_type.startswith("video/"):
         return JSONResponse(content={"error": "Only video files are allowed"}, status_code=400)
 
-    video_path = os.path.join(UPLOAD_DIR, file.filename)
-    audio_path = os.path.join(AUDIO_DIR, f"{os.path.splitext(file.filename)[0]}.mp3")
-    transcript_path = os.path.join(TRANSCRIPT_DIR, f"{os.path.splitext(file.filename)[0]}.txt")
+    job_id = str(uuid.uuid4())
+    video_path = os.path.join(UPLOAD_DIR, f"{job_id}_{file.filename}")
+    audio_path = os.path.join(AUDIO_DIR, f"{job_id}.mp3")
+    transcript_path = os.path.join(TRANSCRIPT_DIR, f"{job_id}.txt")
 
+    # Initialize job state
+    jobs[job_id] = {
+        "status": "created",
+        "video": video_path,
+        "audio": audio_path,
+        "transcript": transcript_path,
+        "error": None,
+        "result": None,
+        "steps": []
+    }
+
+    # Save uploaded file
     await save_file(file, video_path)
+    jobs[job_id]["steps"].append("File saved")
+    jobs[job_id]["status"] = "ready"
+
+    return {"job_id": job_id, "message": "Job created. Use /jobs/{job_id}/stream to track progress."}
+
+
+@app.get("/jobs/{job_id}/stream")
+async def stream_job(job_id: str):
+    if job_id not in jobs:
+        return JSONResponse(content={"error": "Job not found"}, status_code=404)
+
+    job = jobs[job_id]
 
     async def event_generator() -> AsyncGenerator[str, None]:
         try:
-            yield "data: File saved successfully\n\n"
+            # Step 1: Extract audio
+            job["status"] = "extracting"
+            job["steps"].append("Extracting audio")
+            yield "data: Extracting audio...\n\n"
+            await asyncio.to_thread(extract_audio, job["video"], job["audio"])
+            yield "data: Audio extracted\n\n"
 
-            # --- Step 2: Extract audio ---
-            yield "data: Extracting audio from video...\n\n"
-            await asyncio.to_thread(extract_audio, video_path, audio_path)
-            yield "data: Audio extraction done\n\n"
-
-            # --- Step 3: Transcription ---
+            # Step 2: Transcribe
+            job["status"] = "transcribing"
+            job["steps"].append("Transcribing")
             yield "data: Transcribing audio...\n\n"
-            transcript = await asyncio.to_thread(transcribe_audio, audio_path, transcript_path)
+            transcript = await asyncio.to_thread(transcribe_audio, job["audio"], job["transcript"])
+            job["status"] = "completed"
+            job["result"] = transcript
+            job["steps"].append("Completed")
 
-            yield f"data: Transcription completed! Transcript saved at {transcript_path}\n\n"
+            yield f"data: Transcription completed\n\n"
             yield f"data: {transcript}\n\n"
 
         except Exception as e:
+            job["status"] = "error"
+            job["error"] = str(e)
             yield f"data: ERROR: {str(e)}\n\n"
 
         yield "data: DONE\n\n"
@@ -90,29 +100,35 @@ async def transcribe_video_stream(file: UploadFile = File(...)):
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
+@app.get("/jobs/{job_id}")
+async def get_job(job_id: str):
+    if job_id not in jobs:
+        return JSONResponse(content={"error": "Job not found"}, status_code=404)
+    return jobs[job_id]
+
+
+# --- Helpers ---
+
 async def save_file(file: UploadFile, destination: str):
-    """Save uploaded file asynchronously."""
+    """Save uploaded file to disk."""
     with open(destination, "wb") as out_file:
         while chunk := await file.read(1024 * 1024):
             out_file.write(chunk)
 
+
 def extract_audio(video_path: str, audio_path: str):
-    """Extract audio from video using ffmpeg."""
-    command = [
-        "ffmpeg",
-        "-i", video_path,
-        "-vn",               # no video
-        "-acodec", "mp3",    # audio codec
-        audio_path
-    ]
+    """Extract audio track from video."""
+    command = ["ffmpeg", "-i", video_path, "-vn", "-acodec", "mp3", audio_path]
     subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
 
 
-def transcribe_audio(audio_path: str, transcript_path: str):
-    """Transcribe audio and save transcript."""
+def transcribe_audio(audio_path: str, transcript_path: str) -> str:
+    """Transcribe audio file."""
     transcript = aai.Transcriber(config=config).transcribe(audio_path)
     if transcript.status == "error":
         raise RuntimeError(f"Transcription failed: {transcript.error}")
 
     with open(transcript_path, "w", encoding="utf-8") as f:
         f.write(transcript.text)
+
+    return transcript.text
