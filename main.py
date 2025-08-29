@@ -2,10 +2,10 @@ import os
 import uuid
 import asyncio
 import subprocess
-from typing import Dict, AsyncGenerator
+from typing import Dict
 
 from fastapi import FastAPI, File, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 import assemblyai as aai
 from dotenv import load_dotenv
@@ -33,6 +33,9 @@ config = aai.TranscriptionConfig(speech_model=aai.SpeechModel.best)
 jobs: Dict[str, Dict] = {}
 
 
+# ----------------------------
+# API: Create job
+# ----------------------------
 @app.post("/jobs/")
 async def create_job(file: UploadFile = File(...)):
     if not file.content_type.startswith("video/"):
@@ -43,72 +46,40 @@ async def create_job(file: UploadFile = File(...)):
     audio_path = os.path.join(AUDIO_DIR, f"{job_id}.mp3")
     transcript_path = os.path.join(TRANSCRIPT_DIR, f"{job_id}.txt")
 
-    # Initialize job state
+    # Initialize job state (standardized fields)
     jobs[job_id] = {
-        "status": "created",
-        "video": video_path,
-        "audio": audio_path,
-        "transcript": transcript_path,
-        "error": None,
-        "result": None,
+        "id": job_id,
+        "status": "pending",
+        "video_path": video_path,
+        "audio_path": audio_path,
+        "transcript_path": transcript_path,
+        "error_message": None,
+        "transcript_text": None,
         "steps": []
     }
 
     # Save uploaded file
     await save_file(file, video_path)
-    jobs[job_id]["steps"].append("File saved")
-    jobs[job_id]["status"] = "ready"
+    jobs[job_id]["steps"].append("Video uploaded")
 
-    return {"job_id": job_id, "message": "Job created. Use /jobs/{job_id}/stream to track progress."}
+    # Run processing in background
+    asyncio.create_task(process_job(job_id))
 
-
-@app.get("/jobs/{job_id}/stream")
-async def stream_job(job_id: str):
-    if job_id not in jobs:
-        return JSONResponse(content={"error": "Job not found"}, status_code=404)
-
-    job = jobs[job_id]
-
-    async def event_generator() -> AsyncGenerator[str, None]:
-        try:
-            # Step 1: Extract audio
-            job["status"] = "extracting"
-            job["steps"].append("Extracting audio")
-            yield "data: Extracting audio...\n\n"
-            await asyncio.to_thread(extract_audio, job["video"], job["audio"])
-            yield "data: Audio extracted\n\n"
-
-            # Step 2: Transcribe
-            job["status"] = "transcribing"
-            job["steps"].append("Transcribing")
-            yield "data: Transcribing audio...\n\n"
-            transcript = await asyncio.to_thread(transcribe_audio, job["audio"], job["transcript"])
-            job["status"] = "completed"
-            job["result"] = transcript
-            job["steps"].append("Completed")
-
-            yield f"data: Transcription completed\n\n"
-            yield f"data: {transcript}\n\n"
-
-        except Exception as e:
-            job["status"] = "error"
-            job["error"] = str(e)
-            yield f"data: ERROR: {str(e)}\n\n"
-
-        yield "data: DONE\n\n"
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    return {"job_id": job_id, "status": "pending"}
 
 
-@app.get("/jobs/{job_id}")
-async def get_job(job_id: str):
-    if job_id not in jobs:
-        return JSONResponse(content={"error": "Job not found"}, status_code=404)
-    return jobs[job_id]
+# ----------------------------
+# API: Get all jobs
+# ----------------------------
+@app.get("/jobs/")
+async def list_jobs():
+    """Return all jobs and their statuses."""
+    return {"jobs": list(jobs.values())}
 
 
-# --- Helpers ---
-
+# ----------------------------
+# Helpers
+# ----------------------------
 async def save_file(file: UploadFile, destination: str):
     """Save uploaded file to disk."""
     with open(destination, "wb") as out_file:
@@ -116,14 +87,39 @@ async def save_file(file: UploadFile, destination: str):
             out_file.write(chunk)
 
 
+async def process_job(job_id: str):
+    """Background task: extract audio and transcribe."""
+    job = jobs[job_id]
+    try:
+        # Step 1: Extract audio
+        job["status"] = "extracting_audio"
+        job["steps"].append("Extracting audio")
+        await asyncio.to_thread(extract_audio, job["video_path"], job["audio_path"])
+
+        # Step 2: Transcribe
+        job["status"] = "transcribing"
+        job["steps"].append("Transcribing audio")
+        transcript = await asyncio.to_thread(transcribe_audio, job["audio_path"], job["transcript_path"])
+
+        # Completed
+        job["status"] = "completed"
+        job["transcript_text"] = transcript
+        job["steps"].append("Completed")
+
+    except Exception as e:
+        job["status"] = "failed"
+        job["error_message"] = str(e)
+        job["steps"].append("Failed")
+
+
 def extract_audio(video_path: str, audio_path: str):
-    """Extract audio track from video."""
+    """Extract audio track from video using ffmpeg."""
     command = ["ffmpeg", "-i", video_path, "-vn", "-acodec", "mp3", audio_path]
     subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
 
 
 def transcribe_audio(audio_path: str, transcript_path: str) -> str:
-    """Transcribe audio file."""
+    """Transcribe audio file using AssemblyAI."""
     transcript = aai.Transcriber(config=config).transcribe(audio_path)
     if transcript.status == "error":
         raise RuntimeError(f"Transcription failed: {transcript.error}")
